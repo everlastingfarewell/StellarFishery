@@ -1,0 +1,46 @@
+#version 450
+layout(local_size_x=16, local_size_y=16) in;
+layout(set=0,binding=0,r32f) uniform readonly image2D currentHeight;
+layout(set=0,binding=1,r32f) uniform image2D previousHeight;
+layout(set=0,binding=2,rg32f) uniform image2D flow;
+layout(set=0,binding=3,std140) uniform Params {
+    ivec2 origin;
+    int size;
+    int count;
+    float spacing;
+    float dt;
+    float courantSquared;
+    float mass;
+} p;
+struct Contact {
+    vec4 footprint; // world x,z, radius, reciprocal weight sum
+    vec4 momentumTime; // impulse xyz (N s), start of integration tick (s)
+};
+layout(set=0,binding=4,std430) readonly buffer Contacts { Contact events[]; };
+ivec2 physical(ivec2 cell) { return (cell + p.origin) & (p.size - 1); }
+float heightAt(ivec2 cell) {
+    return imageLoad(currentHeight, physical(clamp(cell, ivec2(0), ivec2(p.size-1)))).x;
+}
+void main() {
+    ivec2 cell = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(cell, ivec2(p.size)))) return;
+    ivec2 pos = physical(cell);
+    float h = heightAt(cell);
+    float lap = heightAt(cell+ivec2(1,0)) + heightAt(cell-ivec2(1,0))
+              + heightAt(cell+ivec2(0,1)) + heightAt(cell-ivec2(0,1)) - 4*h;
+    ivec2 edge = min(cell, ivec2(p.size-1)-cell);
+    float sponge = 1-smoothstep(0, 14, float(min(edge.x, edge.y)));
+    float retention = exp(-(0.65 + 48*sponge*sponge)*p.dt);
+    vec3 kick = vec3(0);
+    vec2 world = vec2(cell+p.origin)*p.spacing;
+    for (int i=0; i<p.count; ++i) {
+        vec4 shape = events[i].footprint;
+        vec2 d = (world-shape.xy)/shape.z;
+        float w = max(0, 1-dot(d,d));
+        kick += events[i].momentumTime.xyz * (w*w*shape.w/p.mass);
+    }
+    float next = h + retention*(h-imageLoad(previousHeight,pos).x)
+                   + p.courantSquared*lap + p.dt*kick.y;
+    imageStore(previousHeight,pos,vec4(next));
+    imageStore(flow,pos,vec4(imageLoad(flow,pos).xy*retention+kick.xz,0,0));
+}
