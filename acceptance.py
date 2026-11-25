@@ -42,6 +42,7 @@ def verify_contacts():
 def replay(name, starts, fps):
     canvas = RenderCanvas(size=(384,256), pixel_ratio=1)
     scene = Scene(canvas)
+    scene.preset(False)
     canvas.request_draw(scene.draw)
     water = scene.water
     water.pending.extend(Contact(0,0,0.45,(0,-24,0),t) for t in starts)

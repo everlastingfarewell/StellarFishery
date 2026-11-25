@@ -66,6 +66,8 @@ class Water:
         self.reserve(1)
         self.origin = np.array([-N//2, -N//2])
         self.phase = self.tick = self.consumed = 0
+        self.after_step = None
+        self.foam_images = []
         self.pending = []
         self.remainder = 0.
 
@@ -94,7 +96,7 @@ class Water:
                 if not size:
                     continue
                 ox,oz,w,h = (start,0,size,N) if axis == 0 else (0,start,N,size)
-                for i, image in enumerate(self.images):
+                for i, image in enumerate(self.images+self.foam_images):
                     stride = w * (8 if i == 2 else 4)
                     self.q.write_texture({"texture":image,"origin":(ox,oz,0)}, bytes(h*stride),
                                          {"bytes_per_row":stride}, (w,h,1))
@@ -143,6 +145,8 @@ class Water:
         self.q.submit([encoder.finish()])
         self.phase ^= 1
         self.tick += 1
+        if self.after_step:
+            self.after_step()
 
     def advance(self, seconds):
         self.remainder += seconds
