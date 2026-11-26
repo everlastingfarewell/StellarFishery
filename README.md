@@ -9,7 +9,7 @@ optics (reflection, refraction, crest lighting) and persistent foam.
 | [docs/plan.en.md](docs/plan.en.md) | Full milestone plan, acceptance criteria and Vulkan integration notes |
 | [docs/milestone1.md](docs/milestone1.md) | Calm-water impact simulator and its replay measurements |
 | [docs/ocean.md](docs/ocean.md) | Spectral cascades, optics and foam |
-| [docs/brick.md](docs/brick.md) | TRIMUI Brick port: what works, what blocks it |
+| [docs/brick.md](docs/brick.md) | TrimUI Brick Pro framebuffer demo, installation and hardware results |
 
 ## Repository layout
 
