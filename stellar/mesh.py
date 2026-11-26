@@ -3,6 +3,7 @@ import numpy as np
 
 
 def rings(levels=8, half=32):
+    """Vertex offsets and triangle indices of the stitched clipmap."""
     vertices, triangles, cache = [], [], {}
     def index(x,z):
         if (x,z) not in cache:

@@ -1,24 +1,30 @@
+"""Interactive ocean demo: orbit camera, sun controls and water impacts."""
 import math
 import time
 
 import numpy as np
-from renderer import OceanRenderer
 
-from water import Contact, DT
+from stellar.config import DT
+from stellar.renderer import OceanRenderer
+from stellar.simulation import Contact
 
 
 class Camera:
+    """Orbit camera looking at the water from about ten metres away."""
+
     def __init__(self):
         self.target = np.zeros(3)
         self.yaw, self.pitch, self.distance = 0.55, 0.73, 10.0
 
     def basis(self):
+        """Eye position, right and up vectors, view direction for the current orbit."""
         s, c = math.sin(self.yaw), math.cos(self.yaw)
         back = np.array([s * math.cos(self.pitch), math.sin(self.pitch), c * math.cos(self.pitch)])
         right = np.array([c, 0, -s])
         return self.target + self.distance * back, right, np.cross(back, right), -back
 
     def ray(self, x, y, size):
+        """Ray through a pointer position, for picking the surface."""
         width, height = size
         eye, right, up, forward = self.basis()
         direction = forward + 0.5 * ((2*x-width)*right + (height-2*y)*up)/height
@@ -26,11 +32,14 @@ class Camera:
 
 
 class Scene(OceanRenderer):
+    """The ocean renderer with the demo camera and input handling attached."""
+
     def __init__(self, canvas):
         super().__init__(canvas, Camera())
 
 
 def main():
+    """Open the interactive window; returns when the window is closed."""
     from rendercanvas.glfw import RenderCanvas, loop
     canvas = RenderCanvas(size=(960,640),title="StellarFishery | Open water",update_mode="continuous")
     scene = Scene(canvas)

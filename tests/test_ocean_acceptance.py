@@ -5,11 +5,12 @@ import numpy as np
 from PIL import Image
 from rendercanvas.offscreen import RenderCanvas
 
-from demo import Scene
-from spectrum import LENGTHS,SIZE,seeds
-from water import DT,DX,N,Contact
+from examples.demo import Scene
+from stellar.config import DT, N
+from stellar.simulation import Contact
+from stellar.spectrum import LENGTHS, SIZE, seeds
 
-OUT=Path(__file__).resolve().parent/"captures"/"ocean"
+OUT=Path(__file__).resolve().parent.parent/"captures"/"ocean"
 
 
 def run():
@@ -145,5 +146,9 @@ def run():
     canvas.close()
 
 
-if __name__=="__main__":
+def main():
     run()
+
+
+if __name__=="__main__":
+    main()

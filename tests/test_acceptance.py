@@ -6,10 +6,11 @@ import numpy as np
 from PIL import Image
 from rendercanvas.offscreen import RenderCanvas
 
-from demo import Scene
-from water import Contact, DT, DX, MASS, N, Water
+from examples.demo import Scene
+from stellar.config import DT, DX, MASS, N
+from stellar.simulation import Contact, Water
 
-OUT = Path(__file__).resolve().parent / "captures"
+OUT = Path(__file__).resolve().parent.parent / "captures"
 
 
 def verify_contacts():
@@ -68,7 +69,7 @@ def replay(name, starts, fps):
     return fields,rows
 
 
-if __name__ == "__main__":
+def main():
     OUT.mkdir(exist_ok=True)
     print("First-step center height:",verify_contacts())
     with (OUT/"measurements.csv").open("w",newline="") as out:
@@ -84,3 +85,7 @@ if __name__ == "__main__":
                     np.testing.assert_array_equal(fields,baseline)
                 baseline = fields
             print(name,"identical fields at all 60 shared samples")
+
+
+if __name__ == "__main__":
+    main()

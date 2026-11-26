@@ -1,7 +1,9 @@
 """Directional JONSWAP density and separable Vulkan inverse FFT."""
 import numpy as np
 import wgpu
-from water import ROOT
+
+from .config import SHADERS
+from .platform import prebuilt, shader_module
 
 SIZE = 32
 LENGTHS = (256., 32., 4.)
@@ -48,11 +50,11 @@ class Spectrum:
         self.clock = d.create_buffer(size=16,usage=wgpu.BufferUsage.UNIFORM|wgpu.BufferUsage.COPY_DST)
         temp = d.create_buffer(size=3*SIZE**2*7*8,usage=storage)
         self.field = d.create_buffer(size=3*SIZE**2*32,usage=storage|wgpu.BufferUsage.COPY_SRC)
-        code = (ROOT/"fft.wgsl").read_text()
         self.passes = []
-        module=d.create_shader_module(code=code)
-        for entry,resources in [("rows",{0:self.seed,1:self.clock,2:temp}),
-                                ("columns",{3:temp,4:self.field})]:
+        module = shader_module(d, "spectrum.spv", (SHADERS/"fft.wgsl").read_text(),
+                               prebuilt("spectrum.spv"))
+        for entry, resources in [("rows",{0:self.seed,1:self.clock,2:temp}),
+                                 ("columns",{3:temp,4:self.field})]:
             p=d.create_compute_pipeline(layout="auto",compute={"module":module,"entry_point":entry})
             group=d.create_bind_group(layout=p.get_bind_group_layout(0),entries=[
                 {"binding":i,"resource":{"buffer":buf}} for i,buf in resources.items()])
@@ -68,7 +70,7 @@ class Spectrum:
         w = self.water
         if self.tick == w.tick:
             return
-        from water import DT
+        from .config import DT
         w.q.write_buffer(self.clock,0,np.array([DT*w.tick,0.16 if self.swell and self.speed else 0.,0,0],np.float32))
         enc = w.device.create_command_encoder()
         for pipeline,group in self.passes:

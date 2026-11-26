@@ -1,6 +1,6 @@
 # Open water, optics and foam
 
-Use the installation steps in [MILESTONE1.md](MILESTONE1.md), then run `python demo.py`.
+Use the installation steps in [milestone1.md](milestone1.md), then run `python -m examples.demo` (or `./run.sh`).
 The demo starts in low wind. Press **1** for zero background energy or **2** for low wind. **G** toggles a 320 m analytical swell in wind. Hold **Q/E** to rotate the sun. Right-drag orbits, middle-drag zooms, WASD moves, and left press/release creates a local impact.
 
 ## Milestone 2
@@ -17,6 +17,6 @@ Within the moving 16 m interaction patch, foam accumulates from compression of h
 
 ## Verification
 
-Run `python ocean_acceptance.py` on a Vulkan device. It checks evolved height, both displacement components and slopes against NumPy, tests clipmap edge ownership, samples a crest before and after scrolling, compares the same local impact in both presets, measures offshore foam decay, and resizes the renderer. The full suite passed on AMD Radeon 780M Graphics. The offshore stress shot peaked at full coverage at 0.67 s and fell to 0.00931 at 6.67 s.
+Run `python -m tests.test_ocean_acceptance` on a Vulkan device. It checks evolved height, both displacement components and slopes against NumPy, tests clipmap edge ownership, samples a crest before and after scrolling, compares the same local impact in both presets, measures offshore foam decay, and resizes the renderer. The full suite passed on AMD Radeon 780M Graphics. The offshore stress shot peaked at full coverage at 0.67 s and fell to 0.00931 at 6.67 s.
 
-The [reference recordings](captures/ocean) include a frozen-time camera traverse, matched impact replays, a rock reflection pan, backlit swell, shallow/deep stones, and an advected whitecap. The frozen-time traverse isolates camera-induced motion. The whitecap shot uses two opposing horizontal impulses to make advection and decay repeatable.
+The [reference recordings](../captures/ocean) include a frozen-time camera traverse, matched impact replays, a rock reflection pan, backlit swell, shallow/deep stones, and an advected whitecap. The frozen-time traverse isolates camera-induced motion. The whitecap shot uses two opposing horizontal impulses to make advection and decay repeatable.

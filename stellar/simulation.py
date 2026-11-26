@@ -11,28 +11,40 @@ import tempfile
 import numpy as np
 import wgpu
 
-ROOT = Path(__file__).resolve().parent
-N, DX, SPEED = 128, 0.125, 3.0
-DT = 0.4 * DX / SPEED
-MASS = 1000 * DX**2 * 0.08
+from .config import DT, DX, MASS, N, ROOT, SPEED
+from .platform import platform_profile
+
+# glslc input for the height field, and the bytecode built from it by
+# scripts/build-spv.py for platforms without a shader compiler.
+WAVE_SOURCE = ROOT / "shaders" / "wave.comp"
+PREBUILT = ROOT / "data" / "water.spv"
 
 
 def shader_binary():
+    """SPIR-V for the height-field kernel, compiled now or read from `data/`."""
+    if not platform_profile()["wgsl"] and PREBUILT.is_file():
+        return PREBUILT.read_bytes()
+
     roots = sorted(Path("C:/VulkanSDK").glob("*/Bin"), reverse=True)
     if "VULKAN_SDK" in os.environ:
         roots.insert(0, Path(os.environ["VULKAN_SDK"]) / "Bin")
 
     def executable(name):
-        path = shutil.which(name) or next((r / (name+".exe") for r in roots
+        return shutil.which(name) or next((r / (name+".exe") for r in roots
                                            if (r / (name+".exe")).is_file()), None)
-        if not path:
-            raise RuntimeError(f"Install the Vulkan SDK to provide {name}")
-        return path
+
+    glslc = executable("glslc")
+    if not glslc:
+        if PREBUILT.is_file():
+            return PREBUILT.read_bytes()
+        raise RuntimeError("Install the Vulkan SDK to provide glslc, or run "
+                           "scripts/build-spv.py to create data/water.spv")
 
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "wave.spv"
-        subprocess.run([executable("glslc"), ROOT/"wave.comp", "-o", out], check=True)
-        subprocess.run([executable("spirv-val"), out], check=True)
+        subprocess.run([glslc, WAVE_SOURCE, "-o", out], check=True)
+        if spirv_val := executable("spirv-val"):
+            subprocess.run([spirv_val, out], check=True)
         return out.read_bytes()
 
 
@@ -47,14 +59,25 @@ class Contact:
 
 
 class Water:
+    """128 x 128 height field advanced by a damped wave equation in compute.
+
+    `readback` (in ticks) is how many steps have been read back to the host.
+    Platforms without host readback get a RuntimeError: every step needs it.
+    Picking and buoyancy use the same triangles that `field()` describes, so a
+    platform without host readback cannot answer either of them.
+    """
+
     def __init__(self):
-        os.environ["WGPU_BACKEND_TYPE"] = "Vulkan"
-        self.adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
-        if self.adapter.info["backend_type"] != "Vulkan":
-            raise RuntimeError("Vulkan backend required")
-        self.device = d = self.adapter.request_device_sync(
-            required_features=["texture-adapter-specific-format-features"])
+        from .platform import request_device
+
+        if not platform_profile()["readback"]:
+            raise RuntimeError(
+                "this platform cannot read simulation results back (see "
+                "docs/brick.md), so the height field cannot be stepped or queried")
+        self.adapter, self.device = request_device()
+        d = self.device
         self.q = d.queue
+        self.readback = 0
         usage = (wgpu.TextureUsage.STORAGE_BINDING | wgpu.TextureUsage.TEXTURE_BINDING |
                  wgpu.TextureUsage.COPY_SRC | wgpu.TextureUsage.COPY_DST)
         self.images = [d.create_texture(size=(N,N,1), format=f, usage=usage)
@@ -113,6 +136,7 @@ class Water:
             return (*center,event.radius,1/total,*impulse,time)
 
     def step(self):
+        """Advance one fixed tick and consume the contacts that fall inside it."""
         start, end = self.tick*DT, (self.tick+1)*DT
         remaining, records = [], []
         for event in self.pending:
@@ -149,22 +173,28 @@ class Water:
             self.after_step()
 
     def advance(self, seconds):
+        """Advance as many whole ticks as `seconds` covers."""
         self.remainder += seconds
         while self.remainder >= DT-1e-12:
             self.step()
             self.remainder -= DT
 
     def field(self, index=None):
+        """World-aligned height (NaN-free copy) of a history image, latest by default."""
         i = self.phase if index is None else index
         channels = 2 if i==2 else 1
         data = self.q.read_texture({"texture":self.images[i]},
                                    {"bytes_per_row":N*channels*4}, (N,N,1))
         shape = (N,N,2) if channels==2 else (N,N)
+        self.readback = self.tick
         return np.roll(np.frombuffer(data,np.float32).reshape(shape),
                        tuple(-self.origin[::-1]),axis=(0,1))
 
     def pick(self, eye, ray):
-        # Intersect the exact two triangles per cell used by the indexed draw.
+        """World-space hit of `ray` against the height field, or None.
+
+        Intersects the exact two triangles per cell used by the indexed draw.
+        """
         h = self.field()
         x,z = (np.arange(N-1) + self.origin[:,None])*DX
         hits = []
