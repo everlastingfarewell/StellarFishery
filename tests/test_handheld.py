@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from stellar.handheld import Camera, Ocean, Stick
+from stellar.handheld import Camera, Ocean, Stick, bottom_height, terrain_hit, shore_segment, caustic_strength
 
 
 class HandheldTests(unittest.TestCase):
@@ -15,18 +15,18 @@ class HandheldTests(unittest.TestCase):
         camera.move([2000, -2000, 2000, -2000], 0.1)
         self.assertEqual(camera, Camera())
         camera.move([0, -32768, 0, 0], 0.1)
-        self.assertAlmostEqual(camera.z, -11.4)
+        self.assertAlmostEqual(camera.z, -11.1)
         camera.move([32767, 0, 0, 0], 0.1)
-        self.assertAlmostEqual(camera.x, 0.6)
+        self.assertAlmostEqual(camera.x, 0.9)
         camera = Camera(yaw=math.pi / 2)
         camera.move([0, -32768, 0, 0], 0.1)
-        self.assertAlmostEqual(camera.x, 0.6)
+        self.assertAlmostEqual(camera.x, 0.9)
         self.assertAlmostEqual(camera.z, -12)
 
     def test_diagonal_speed_and_time_steps(self):
         camera = Camera()
         camera.move([32767, -32768, 0, 0], 0.1)
-        self.assertAlmostEqual(math.hypot(camera.x, camera.z + 12), 0.6)
+        self.assertAlmostEqual(math.hypot(camera.x, camera.z + 12), 0.9)
         fine, coarse = Camera(), Camera()
         for _ in range(20):
             fine.move([0, -32768, 0, 0], 0.05)
@@ -78,29 +78,29 @@ class HandheldTests(unittest.TestCase):
         # Include a reordered map to catch reliance on fixed button indices.
         for mapping in ((304, 305, 307, 308, 310, 311, 314, 315), (311, 304, 310)):
             stick = Stick(bytes([0, 1, 3, 4]), mapping)
-            camera = Camera()
+            camera = Camera(x=8, height=-0.5)
             r1, l1 = mapping.index(311), mapping.index(310)
             stick.event(struct.pack("=IhBB", 0, 1, 0x81, r1))
             camera.move([0] * 4, 0.1, stick.vertical)
-            self.assertAlmostEqual(camera.height, 4.3)
+            self.assertAlmostEqual(camera.height, -0.05)
             stick.event(struct.pack("=IhBB", 0, 1, 1, l1))
             self.assertEqual(stick.vertical, 0)
             stick.event(struct.pack("=IhBB", 0, 0, 1, r1))
             for _ in range(20):
                 camera.move([0] * 4, 0.1, stick.vertical)
-            self.assertAlmostEqual(camera.height, -1.7)
+            self.assertAlmostEqual(camera.height, float(bottom_height(camera.x, camera.z)) + 1.6)
             stick.event(struct.pack("=IhBB", 0, 0, 1, l1))
             self.assertEqual(stick.vertical, 0)
         ocean = Ocean.for_display(1024, 768)
         baseline = np.asarray(ocean.frame(1))
-        ocean.camera.height = 8
+        ocean.camera.height = 0.3
         raised = np.asarray(ocean.frame(1))
         self.assertFalse(np.array_equal(raised, baseline))
         self.assertTrue(np.isfinite(ocean.haze).all())
         ocean.camera.height = 4
         np.testing.assert_array_equal(ocean.frame(1), baseline)
 
-    def test_unlimited_height_crosses_surface(self):
+    def test_bounded_height_crosses_surface(self):
         ocean = Ocean.for_display(1024, 768)
         with np.errstate(over="raise", invalid="raise", divide="raise", under="ignore"):
             for height in (0.01, 0, -0.01, -4, -10000, 10000):
@@ -110,7 +110,7 @@ class HandheldTests(unittest.TestCase):
                 self.assertTrue(((ocean.haze >= 0) & (ocean.haze <= 1)).all())
         camera = Camera(height=10000)
         camera.move([0] * 4, 0.1, 1)
-        self.assertAlmostEqual(camera.height, 10000.3)
+        self.assertAlmostEqual(camera.height, 0.8)
 
     def test_shoulders_do_not_exit_at_legacy_indices(self):
         stick = Stick(bytes([0, 1, 3, 4]), (304, 305, 307, 308, 314, 315, 310, 311))
@@ -119,6 +119,7 @@ class HandheldTests(unittest.TestCase):
 
     def test_underwater_skips_surface_work_and_resumes(self):
         ocean = Ocean.for_display(1024, 768)
+        ocean.camera.x = 8
         baseline = np.asarray(ocean.frame(1))
         self.assertIsNone(ocean.caustics)
         ocean.camera.height = -2
@@ -137,11 +138,13 @@ class HandheldTests(unittest.TestCase):
 
     def test_underwater_projection_and_deep_fog(self):
         ocean = Ocean.for_display(1024, 768)
+        ocean.camera.x = 8
         ocean.camera.height = -2
         baseline = np.asarray(ocean.frame(1))
         ocean.camera.x += 2
         self.assertFalse(np.array_equal(ocean.frame(1), baseline))
         ocean.camera.height = -10000
+        ocean.camera.x = 2000
         deep = np.asarray(ocean.frame(1))
         self.assertLess(deep.mean(), baseline.mean())
         self.assertFalse(ocean.caustic_pixels.any())
@@ -153,6 +156,55 @@ class HandheldTests(unittest.TestCase):
                     frame = np.asarray(ocean.frame(1e8))
                 self.assertEqual(frame.shape, (144, 192, 3))
                 self.assertTrue(np.isfinite(ocean.underwater_base).all())
+
+    def test_bottom_clearance_and_shore(self):
+        camera = Camera(x=0, height=-100)
+        camera.move([0] * 4, 0.1, -1)
+        self.assertAlmostEqual(camera.height - bottom_height(camera.x, camera.z), 1.6)
+        for _ in range(100):
+            camera.move([-32768, 0, 0, 0], 0.1, -1)
+            self.assertGreaterEqual(camera.height - bottom_height(camera.x, camera.z), 1.6 - 1e-6)
+            self.assertLessEqual(camera.height, max(0.8, float(bottom_height(camera.x, camera.z)) + 1.6))
+        shore, _ = shore_segment(0)
+        self.assertEqual(bottom_height(shore), 0)
+        self.assertGreater(bottom_height(-10), 0)
+        self.assertEqual(bottom_height(-100), 4)
+        self.assertLess(bottom_height(20), bottom_height(0))
+        for x in (-100, -20, 0, 20):
+            camera = Camera(x=x, height=10)
+            hit = terrain_hit(camera, np.array([1.0]), np.array([0.0]))[0]
+            self.assertAlmostEqual(10 - hit, bottom_height(x, camera.z), places=4)
+
+
+    def test_facet_angles_and_caustic_fade(self):
+        for z in (-57, 5, 39):
+            shore, _ = shore_segment(z)
+            for x, angle in ((shore - 8, 10), (shore + 8, 15)):
+                dx = (bottom_height(x + 0.01, z) - bottom_height(x, z)) / 0.01
+                dz = (bottom_height(x, z + 0.01) - bottom_height(x, z)) / 0.01
+                self.assertAlmostEqual(math.degrees(math.atan(math.hypot(dx, dz))), angle, places=3)
+        self.assertNotEqual(shore_segment(5)[0], shore_segment(39)[0])
+        fade = caustic_strength(np.array([2, 8, 16]), np.array([4, 4, 4]))
+        self.assertTrue(np.all(np.diff(fade) < 0))
+        self.assertEqual(fade[-1], 0)
+        self.assertEqual(caustic_strength(2, 18.2), 0)
+
+    def test_walk_onshore_and_return_to_water(self):
+        camera = Camera()
+        start_x = camera.x
+        for _ in range(30):
+            camera.move([-32768, 0, 0, 0], 0.1, -1)
+        self.assertAlmostEqual(camera.x, start_x - 27)
+        self.assertGreater(bottom_height(camera.x, camera.z), 0)
+        self.assertAlmostEqual(camera.height, bottom_height(camera.x, camera.z) + 1.6)
+        for _ in range(40):
+            camera.move([32767, 0, 0, 0], 0.1)
+        self.assertAlmostEqual(camera.x, start_x + 9)
+        self.assertLessEqual(camera.height, 0.8)
+        for _ in range(20):
+            camera.move([0] * 4, 0.1, -1)
+        self.assertLess(camera.height, 0)
+        self.assertGreaterEqual(camera.height, bottom_height(camera.x, camera.z) + 1.6 - 1e-6)
 
 
 if __name__ == "__main__":

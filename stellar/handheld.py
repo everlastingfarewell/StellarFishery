@@ -14,13 +14,79 @@ from .waves import LENGTHS, SIZE, seeds
 from dataclasses import dataclass
 
 
+BEACH_SLOPE = math.tan(math.radians(10))
+SEABED_SLOPE = math.tan(math.radians(15))
+MAX_BEACH_HEIGHT = 4.0
+SHORE_SPACING = 24.0
+SHORE_OFFSETS = np.random.default_rng(419).uniform(-3, 3, 64).astype(np.float32) - 6
+
+
+def shore_segment(z):
+    segment = np.floor(np.asarray(z) / SHORE_SPACING).astype(np.int64)
+    left = SHORE_OFFSETS[segment % len(SHORE_OFFSETS)]
+    right = SHORE_OFFSETS[(segment + 1) % len(SHORE_OFFSETS)]
+    gradient = (right - left) / SHORE_SPACING
+    shore = left + gradient * (np.asarray(z) - segment * SHORE_SPACING)
+    return shore, gradient
+
+
+def bottom_height(x, z=0):
+    shore, gradient = shore_segment(z)
+    offshore = np.asarray(x) - shore
+    slope = np.where(offshore >= 0, SEABED_SLOPE, BEACH_SLOPE)
+    return np.minimum(-slope * offshore / np.sqrt(1 + gradient * gradient), MAX_BEACH_HEIGHT)
+
+
+def terrain_hit(camera, down, right, forward=None, limit=250):
+    """Intersect planar shore/seabed facets with shared polygon edges."""
+    if forward is None:
+        forward = np.zeros_like(down)
+    end_z = camera.z + forward * limit
+    first = math.floor(min(camera.z, float(end_z.min())) / SHORE_SPACING)
+    last = math.floor(max(camera.z, float(end_z.max())) / SHORE_SPACING)
+    hit = np.full(down.shape, np.inf, dtype=np.float32)
+    for segment in range(first, last + 1):
+        start_z = segment * SHORE_SPACING
+        shore, gradient = shore_segment(start_z)
+        offset = camera.x - shore - gradient * (camera.z - start_z)
+        for offshore, slope in ((False, BEACH_SLOPE), (True, SEABED_SLOPE)):
+            slope /= math.sqrt(1 + gradient * gradient)
+            denominator = down - slope * (right - gradient * forward)
+            travel = (camera.height + slope * offset) / np.where(abs(denominator) > 1e-8, denominator, 1e-8)
+            z = camera.z + travel * forward
+            side = offset + travel * (right - gradient * forward)
+            valid = ((travel > 0) & (travel <= limit) & (z >= start_z)
+                     & (z <= start_z + SHORE_SPACING) & ((side >= 0) if offshore else
+                     ((side <= 0) & (-slope * side <= MAX_BEACH_HEIGHT))))
+            hit = np.minimum(hit, np.where(valid, travel, np.inf))
+    # Inland plateau uses the same height cap as camera collision.
+    travel = (camera.height - MAX_BEACH_HEIGHT) / np.where(abs(down) > 1e-8, down, 1e-8)
+    plateau = bottom_height(camera.x + right * travel, camera.z + forward * travel)
+    valid = (travel > 0) & (travel <= limit) & (plateau >= MAX_BEACH_HEIGHT)
+    hit = np.minimum(hit, np.where(valid, travel, np.inf))
+    return hit
+
+
+def caustic_strength(depth, distance):
+    # Linear fades reach zero so invisible texture reads can stop.
+    depth = np.asarray(depth, dtype=np.float16)
+    distance = np.asarray(distance, dtype=np.float16)
+    return np.clip((np.float16(16) - depth) / np.float16(14), 0, 1) * np.clip(
+        (np.float16(18.2) - distance) / np.float16(15.4), 0, 1)
+
+
+def sand_grain(x, z):
+    # Cached world-space coarse albedo, requiring no texture samples.
+    return 0.88 + 0.12 * ((np.floor(x * 9) * 13 + np.floor(z * 9) * 7) % 17) / 16
+
+
 @dataclass
 class Camera:
     x: float = 0.0
     z: float = -12.0
     yaw: float = 0.0
     pitch: float = 0.0
-    height: float = 4.0
+    height: float = 0.8
 
     def move(self, axes, seconds, vertical=0):
         # Linux joystick values are negative when pushed up or left.
@@ -28,13 +94,21 @@ class Camera:
         values = np.sign(values) * np.maximum(np.abs(values) - 0.15, 0) / 0.85
         left_x, left_y, right_x, right_y = values
         seconds = min(max(seconds, 0), 0.1)
-        self.height += vertical * 3 * seconds
+        self.height += vertical * 4.5 * seconds
         self.yaw = (self.yaw + right_x * 1.4 * seconds + math.pi) % (2 * math.pi) - math.pi
         self.pitch = float(np.clip(self.pitch - right_y * seconds, -1.2, 1.2))
         length = max(1.0, math.hypot(left_x, left_y))
         sideways, forward = left_x / length, -left_y / length
-        self.x += (sideways * math.cos(self.yaw) + forward * math.sin(self.yaw)) * 6 * seconds
-        self.z += (forward * math.cos(self.yaw) - sideways * math.sin(self.yaw)) * 6 * seconds
+        self.x += (sideways * math.cos(self.yaw) + forward * math.sin(self.yaw)) * 9 * seconds
+        self.z += (forward * math.cos(self.yaw) - sideways * math.sin(self.yaw)) * 9 * seconds
+        self.constrain()
+
+    def constrain(self):
+        floor = float(bottom_height(self.x, self.z)) + 1.6
+        # Shallow water and land require head clearance above the sea-level
+        # cap. Follow the terrain there without restricting horizontal travel.
+        ceiling = max(0.8, floor)
+        self.height = min(ceiling, max(self.height, floor))
 
 
 class Stick:
@@ -91,6 +165,7 @@ class Ocean:
 
     def update_view(self):
         camera = self.camera
+        camera.constrain()
         view = (camera.x, camera.z, camera.yaw, camera.pitch, camera.height)
         if view == self.view:
             return
@@ -108,9 +183,19 @@ class Ocean:
         distance = abs(camera.height) / np.maximum(toward_water, 0.001)
         x = camera.x + (self.ray_right * math.cos(camera.yaw) + forward * math.sin(camera.yaw)) * distance
         z = camera.z + (forward * math.cos(camera.yaw) - self.ray_right * math.sin(camera.yaw)) * distance
-        self.depth = np.clip(0.32 * (x + 6), 0, 6)
+        self.depth = np.clip(-bottom_height(x, z), 0, 6)
         self.haze = np.exp(-distance / 95)
         self.sky_color = np.stack((133 - 96*down, 171 - 46*down, 192 - 38*down), axis=-1)
+        right = self.ray_right * math.cos(camera.yaw) + forward * math.sin(camera.yaw)
+        world_forward = forward * math.cos(camera.yaw) - self.ray_right * math.sin(camera.yaw)
+        land_distance = terrain_hit(camera, down, right, world_forward)
+        land_x = camera.x + right * np.minimum(land_distance, 10000)
+        self.land = np.isfinite(land_distance) & ((land_distance < distance) | self.sky)
+        land_z = camera.z + (forward * math.cos(camera.yaw) - self.ray_right * math.sin(camera.yaw)) * np.minimum(land_distance, 10000)
+        grain = sand_grain(land_x, land_z)
+        self.land_color = grain[..., None] * np.array((186, 169, 126), dtype=np.float32)
+        land_fog = np.clip(land_distance / 250, 0, 1)[..., None]
+        self.land_color = self.land_color * (1 - land_fog) + self.sky_color * land_fog
         self.samples = []
         for length in LENGTHS:
             u, v = (x % length) * SIZE / length, (z % length) * SIZE / length
@@ -118,16 +203,17 @@ class Ocean:
             self.samples.append((i % SIZE, j % SIZE, (u-i).astype(np.float32), (v-j).astype(np.float32)))
 
     def update_underwater_view(self, down, forward):
-        """Cache a flat seabed and water ceiling at the internal resolution."""
+        """Cache curved seabed intersections and the flat water ceiling."""
         if self.caustics is None:
             with Image.open(Path(__file__).with_name("caustics.png")) as texture:
                 self.caustics = np.asarray(texture.convert("L")).copy()
         camera = self.camera
-        # Seabed at -6 m. Crossing it is allowed; beyond it the view is fog.
-        bed_distance = (camera.height + 6) / np.maximum(down, 0.001)
-        bed = (down > 0) & (camera.height >= -6)
+        right = self.ray_right * math.cos(camera.yaw) + forward * math.sin(camera.yaw)
+        world_forward = forward * math.cos(camera.yaw) - self.ray_right * math.sin(camera.yaw)
+        bed_distance = terrain_hit(camera, down, right, world_forward, limit=32)
         ceiling_distance = -camera.height / np.maximum(-down, 0.001)
         ceiling = down < 0
+        bed = np.isfinite(bed_distance) & (~ceiling | (bed_distance < ceiling_distance))
         distance = np.where(bed, bed_distance, np.where(ceiling, ceiling_distance, 32))
         # Linear distance fog and a single depth tint replace optical integration.
         # World projection stays float32; UV, color and fog work uses float16.
@@ -137,11 +223,16 @@ class Ocean:
         self.underwater_base = np.empty((*down.shape, 3), dtype=np.float16)
         self.underwater_base[:] = np.array((48, 119, 127), dtype=np.float16)
         self.underwater_base[bed] = np.array((112, 142, 111), dtype=np.float16)
+        ground_x = camera.x + right * np.minimum(bed_distance, 32)
+        ground_z = camera.z + (forward * math.cos(camera.yaw) - self.ray_right * math.sin(camera.yaw)) * np.minimum(bed_distance, 32)
+        self.underwater_base[bed] *= sand_grain(ground_x[bed], ground_z[bed]).astype(np.float16)[:, None]
         self.underwater_base *= np.array((1 - depth * np.float16(0.8), 1 - depth * np.float16(0.4),
                                           1 - depth * np.float16(0.2)), dtype=np.float16)
         self.underwater_base *= (1 - fog[..., None])
         self.underwater_fog = fog[..., None] * self.underwater_fog_color
-        self.caustic_pixels = bed & (fog < 1)
+        strength = caustic_strength(np.clip(-bottom_height(ground_x, ground_z), 0, 1000), np.minimum(distance, 32))
+        self.caustic_pixels = bed & (fog < 1) & (strength > 0)
+        self.caustic_fade = strength[self.caustic_pixels]
         travel = distance[self.caustic_pixels]
         x = camera.x + (self.ray_right[self.caustic_pixels] * math.cos(camera.yaw)
                         + forward[self.caustic_pixels] * math.sin(camera.yaw)) * travel
@@ -156,7 +247,7 @@ class Ocean:
         u = (self.caustic_u + np.float16((seconds * 0.025) % 1)) % np.float16(1)
         v = (self.caustic_v + np.float16((seconds * 0.018) % 1)) % np.float16(1)
         pattern = self.caustics[(v * height).astype(np.intp), (u * width).astype(np.intp)]
-        factor = np.float16(0.78) + pattern.astype(np.float16) * np.float16(0.8 / 255)
+        factor = 1 + (np.float16(-0.22) + pattern.astype(np.float16) * np.float16(0.8 / 255)) * self.caustic_fade
         color = self.underwater_base.copy()
         color[self.caustic_pixels] *= factor[:, None]
         color += self.underwater_fog
@@ -185,10 +276,11 @@ class Ocean:
         water[self.depth == 0] = (186, 169, 126)
         color = water*self.haze[..., None] + self.sky_color*(1-self.haze[..., None])
         color[self.sky] = self.sky_color[self.sky]
+        color[self.land] = self.land_color[self.land]
         return Image.fromarray(np.clip(color, 0, 255).astype(np.uint8))
 
 
-def run(frames, initial_height=4):
+def run(frames, initial_height=0.8):
     import fcntl
     import mmap
 
@@ -238,7 +330,7 @@ def run(frames, initial_height=4):
             print(f"{count} frames in {time.monotonic()-start:.2f}s", flush=True)
 
 
-def window(height=4):
+def window(height=0.8):
     import tkinter as tk
     from PIL import ImageTk
 
@@ -268,7 +360,7 @@ if __name__ == "__main__":
     mode.add_argument("--preview", metavar="PNG", help="save one Brick-sized PNG on this computer")
     mode.add_argument("--window", action="store_true", help="animate the handheld renderer in a desktop window")
     parser.add_argument("--time", type=float, metavar="SECONDS", help="preview time in seconds (default 0)")
-    parser.add_argument("--height", type=float, default=4, metavar="METRES",
+    parser.add_argument("--height", type=float, default=0.8, metavar="METRES",
                         help="initial camera height; negative values start underwater")
     args = parser.parse_args()
     if args.time is not None and (not args.preview or not math.isfinite(args.time) or args.time < 0):
