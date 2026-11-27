@@ -73,6 +73,32 @@ class HandheldTests(unittest.TestCase):
         ocean.camera = Camera()
         np.testing.assert_array_equal(ocean.frame(1), baseline)
 
+    def test_height_buttons_and_projection(self):
+        # Include a reordered map to catch reliance on fixed button indices.
+        for mapping in ((304, 305, 307, 308, 310, 311, 314, 315), (311, 304, 310)):
+            stick = Stick(bytes([0, 1, 3, 4]), mapping)
+            camera = Camera()
+            r1, l1 = mapping.index(311), mapping.index(310)
+            stick.event(struct.pack("=IhBB", 0, 1, 0x81, r1))
+            camera.move([0] * 4, 0.1, stick.vertical)
+            self.assertAlmostEqual(camera.height, 4.3)
+            stick.event(struct.pack("=IhBB", 0, 1, 1, l1))
+            self.assertEqual(stick.vertical, 0)
+            stick.event(struct.pack("=IhBB", 0, 0, 1, r1))
+            for _ in range(20):
+                camera.move([0] * 4, 0.1, stick.vertical)
+            self.assertEqual(camera.height, 0.5)
+            stick.event(struct.pack("=IhBB", 0, 0, 1, l1))
+            self.assertEqual(stick.vertical, 0)
+        ocean = Ocean.for_display(1024, 768)
+        baseline = np.asarray(ocean.frame(1))
+        ocean.camera.height = 8
+        raised = np.asarray(ocean.frame(1))
+        self.assertFalse(np.array_equal(raised, baseline))
+        self.assertTrue(np.isfinite(ocean.haze).all())
+        ocean.camera.height = 4
+        np.testing.assert_array_equal(ocean.frame(1), baseline)
+
 
 if __name__ == "__main__":
     unittest.main()

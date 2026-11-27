@@ -19,13 +19,15 @@ class Camera:
     z: float = -12.0
     yaw: float = 0.0
     pitch: float = 0.0
+    height: float = 4.0
 
-    def move(self, axes, seconds):
+    def move(self, axes, seconds, vertical=0):
         # Linux joystick values are negative when pushed up or left.
         values = np.clip(np.asarray(axes, dtype=float) / 32767, -1, 1)
         values = np.sign(values) * np.maximum(np.abs(values) - 0.15, 0) / 0.85
         left_x, left_y, right_x, right_y = values
         seconds = min(max(seconds, 0), 0.1)
+        self.height = max(0.5, self.height + vertical * 3 * seconds)
         self.yaw = (self.yaw + right_x * 1.4 * seconds + math.pi) % (2 * math.pi) - math.pi
         self.pitch = float(np.clip(self.pitch - right_y * seconds, -1.2, 1.2))
         length = max(1.0, math.hypot(left_x, left_y))
@@ -35,7 +37,7 @@ class Camera:
 
 
 class Stick:
-    def __init__(self, axis_map):
+    def __init__(self, axis_map, button_map=()):
         # JSIOCGAXMAP reports ABS codes in joystick-event index order.
         pairs = ((0, 1, 3, 4), (0, 1, 2, 5))
         codes = next((pair for pair in pairs if all(code in axis_map for code in pair)), None)
@@ -43,11 +45,20 @@ class Stick:
             raise RuntimeError(f"Cannot identify both analog sticks in axis map {list(axis_map)}")
         self.indices = tuple(axis_map.index(code) for code in codes)
         self.values = [0, 0, 0, 0]
+        # BTN_TL and BTN_TR identify L1 and R1 independently of event order.
+        self.shoulders = tuple(button_map.index(code) if code in button_map else None for code in (310, 311))
+        self.pressed = [False, False]
+
+    @property
+    def vertical(self):
+        return int(self.pressed[1]) - int(self.pressed[0])
 
     def event(self, packet):
         _, value, kind, number = struct.unpack("=IhBB", packet)
         if kind & 0x7f == 2 and number in self.indices:
             self.values[self.indices.index(number)] = value
+        if kind & 0x7f == 1 and number in self.shoulders:
+            self.pressed[self.shoulders.index(number)] = bool(value)
         # Initialization events establish axis state, but never trigger exit.
         return kind == 1 and value != 0 and number in (6, 7)
 
@@ -78,15 +89,15 @@ class Ocean:
 
     def update_view(self):
         camera = self.camera
-        view = (camera.x, camera.z, camera.yaw, camera.pitch)
+        view = (camera.x, camera.z, camera.yaw, camera.pitch, camera.height)
         if view == self.view:
             return
         self.view = view
-        # View rays cross a horizontal ocean from a camera four metres up.
+        # Intersect the view rays with the horizontal ocean plane.
         down = self.ray_down * math.cos(camera.pitch) - math.sin(camera.pitch)
         forward = math.cos(camera.pitch) + self.ray_down * math.sin(camera.pitch)
         self.sky = down <= 0
-        distance = 4 / np.maximum(down, 0.001)
+        distance = camera.height / np.maximum(down, 0.001)
         x = camera.x + (self.ray_right * math.cos(camera.yaw) + forward * math.sin(camera.yaw)) * distance
         z = camera.z + (forward * math.cos(camera.yaw) - self.ray_right * math.sin(camera.yaw)) * distance
         self.depth = np.clip(0.32 * (x + 6), 0, 6)
@@ -142,15 +153,18 @@ def run(frames):
             try:
                 axis_count = fcntl.ioctl(stick, 0x80016a11, bytes(1))[0]
                 axis_map = fcntl.ioctl(stick, 0x80406a32, bytes(64))[:axis_count]
-                controls = Stick(axis_map)
+                button_count = fcntl.ioctl(stick, 0x80016a12, bytes(1))[0]
+                button_map = struct.unpack("=512H", fcntl.ioctl(stick, 0x84006a34, bytes(1024)))[:button_count]
+                controls = Stick(axis_map, button_map)
                 print(f"Stick axes LX/LY/RX/RY: {controls.indices}", flush=True)
+                print(f"Height buttons L1/R1: {controls.shoulders}", flush=True)
                 previous = start
                 while frames == 0 or count < frames:
                     while select.select([stick], [], [], 0)[0]:
                         if controls.event(os.read(stick, 8)):
                             return
                     now = time.monotonic()
-                    ocean.camera.move(controls.values, now - previous)
+                    ocean.camera.move(controls.values, now - previous, controls.vertical)
                     previous = now
                     image = ocean.display_frame(now-start, (width, height))
                     raw = image.convert("RGBA").tobytes("raw", "BGRA")
