@@ -27,7 +27,7 @@ class Camera:
         values = np.sign(values) * np.maximum(np.abs(values) - 0.15, 0) / 0.85
         left_x, left_y, right_x, right_y = values
         seconds = min(max(seconds, 0), 0.1)
-        self.height = max(0.5, self.height + vertical * 3 * seconds)
+        self.height += vertical * 3 * seconds
         self.yaw = (self.yaw + right_x * 1.4 * seconds + math.pi) % (2 * math.pi) - math.pi
         self.pitch = float(np.clip(self.pitch - right_y * seconds, -1.2, 1.2))
         length = max(1.0, math.hypot(left_x, left_y))
@@ -60,7 +60,7 @@ class Stick:
         if kind & 0x7f == 1 and number in self.shoulders:
             self.pressed[self.shoulders.index(number)] = bool(value)
         # Initialization events establish axis state, but never trigger exit.
-        return kind == 1 and value != 0 and number in (6, 7)
+        return kind == 1 and value != 0 and number in (6, 7) and number not in self.shoulders
 
 
 class Ocean:
@@ -96,8 +96,11 @@ class Ocean:
         # Intersect the view rays with the horizontal ocean plane.
         down = self.ray_down * math.cos(camera.pitch) - math.sin(camera.pitch)
         forward = math.cos(camera.pitch) + self.ray_down * math.sin(camera.pitch)
-        self.sky = down <= 0
-        distance = camera.height / np.maximum(down, 0.001)
+        # Below the plane, upward rays intersect water. Keep ray travel
+        # positive so haze remains bounded on either side of the surface.
+        toward_water = down if camera.height >= 0 else -down
+        self.sky = toward_water <= 0
+        distance = abs(camera.height) / np.maximum(toward_water, 0.001)
         x = camera.x + (self.ray_right * math.cos(camera.yaw) + forward * math.sin(camera.yaw)) * distance
         z = camera.z + (forward * math.cos(camera.yaw) - self.ray_right * math.sin(camera.yaw)) * distance
         self.depth = np.clip(0.32 * (x + 6), 0, 6)
@@ -105,7 +108,7 @@ class Ocean:
         self.sky_color = np.stack((133 - 96*down, 171 - 46*down, 192 - 38*down), axis=-1)
         self.samples = []
         for length in LENGTHS:
-            u, v = x * SIZE / length, z * SIZE / length
+            u, v = (x % length) * SIZE / length, (z % length) * SIZE / length
             i, j = np.floor(u).astype(int), np.floor(v).astype(int)
             self.samples.append((i % SIZE, j % SIZE, (u-i).astype(np.float32), (v-j).astype(np.float32)))
 

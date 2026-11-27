@@ -87,7 +87,7 @@ class HandheldTests(unittest.TestCase):
             stick.event(struct.pack("=IhBB", 0, 0, 1, r1))
             for _ in range(20):
                 camera.move([0] * 4, 0.1, stick.vertical)
-            self.assertEqual(camera.height, 0.5)
+            self.assertAlmostEqual(camera.height, -1.7)
             stick.event(struct.pack("=IhBB", 0, 0, 1, l1))
             self.assertEqual(stick.vertical, 0)
         ocean = Ocean.for_display(1024, 768)
@@ -98,6 +98,23 @@ class HandheldTests(unittest.TestCase):
         self.assertTrue(np.isfinite(ocean.haze).all())
         ocean.camera.height = 4
         np.testing.assert_array_equal(ocean.frame(1), baseline)
+
+    def test_unlimited_height_crosses_surface(self):
+        ocean = Ocean.for_display(1024, 768)
+        with np.errstate(over="raise", invalid="raise", divide="raise", under="ignore"):
+            for height in (0.01, 0, -0.01, -4, -10000, 10000):
+                ocean.camera.height = height
+                ocean.frame(1)
+                self.assertTrue(np.isfinite(ocean.haze).all())
+                self.assertTrue(((ocean.haze >= 0) & (ocean.haze <= 1)).all())
+        camera = Camera(height=10000)
+        camera.move([0] * 4, 0.1, 1)
+        self.assertAlmostEqual(camera.height, 10000.3)
+
+    def test_shoulders_do_not_exit_at_legacy_indices(self):
+        stick = Stick(bytes([0, 1, 3, 4]), (304, 305, 307, 308, 314, 315, 310, 311))
+        self.assertFalse(stick.event(struct.pack("=IhBB", 0, 1, 1, 7)))
+        self.assertEqual(stick.vertical, 1)
 
 
 if __name__ == "__main__":
