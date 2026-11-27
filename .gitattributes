@@ -1,0 +1,2 @@
+tools/brick-app/launch.sh text eol=lf
+tools/deploy-brick.sh text eol=lf

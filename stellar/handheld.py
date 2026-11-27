@@ -1,0 +1,211 @@
+"""CPU spectral ocean for the stock TrimUI framebuffer."""
+import argparse
+import math
+import os
+import select
+import struct
+import time
+
+import numpy as np
+from PIL import Image
+
+from .waves import LENGTHS, SIZE, seeds
+from dataclasses import dataclass
+
+
+@dataclass
+class Camera:
+    x: float = 0.0
+    z: float = -12.0
+    yaw: float = 0.0
+    pitch: float = 0.0
+
+    def move(self, axes, seconds):
+        # Linux joystick values are negative when pushed up or left.
+        values = np.clip(np.asarray(axes, dtype=float) / 32767, -1, 1)
+        values = np.sign(values) * np.maximum(np.abs(values) - 0.15, 0) / 0.85
+        left_x, left_y, right_x, right_y = values
+        seconds = min(max(seconds, 0), 0.1)
+        self.yaw = (self.yaw + right_x * 1.4 * seconds + math.pi) % (2 * math.pi) - math.pi
+        self.pitch = float(np.clip(self.pitch - right_y * seconds, -1.2, 1.2))
+        length = max(1.0, math.hypot(left_x, left_y))
+        sideways, forward = left_x / length, -left_y / length
+        self.x += (sideways * math.cos(self.yaw) + forward * math.sin(self.yaw)) * 6 * seconds
+        self.z += (forward * math.cos(self.yaw) - sideways * math.sin(self.yaw)) * 6 * seconds
+
+
+class Stick:
+    def __init__(self, axis_map):
+        # JSIOCGAXMAP reports ABS codes in joystick-event index order.
+        pairs = ((0, 1, 3, 4), (0, 1, 2, 5))
+        codes = next((pair for pair in pairs if all(code in axis_map for code in pair)), None)
+        if codes is None:
+            raise RuntimeError(f"Cannot identify both analog sticks in axis map {list(axis_map)}")
+        self.indices = tuple(axis_map.index(code) for code in codes)
+        self.values = [0, 0, 0, 0]
+
+    def event(self, packet):
+        _, value, kind, number = struct.unpack("=IhBB", packet)
+        if kind & 0x7f == 2 and number in self.indices:
+            self.values[self.indices.index(number)] = value
+        # Initialization events establish axis state, but never trigger exit.
+        return kind == 1 and value != 0 and number in (6, 7)
+
+
+class Ocean:
+    @classmethod
+    def for_display(cls, width, height):
+        return cls(192, round(192 * height / width))
+
+    def display_frame(self, seconds, size):
+        return self.frame(seconds).resize(size, Image.Resampling.NEAREST)
+
+    def __init__(self, width, height):
+        self.camera = Camera()
+        self.view = None
+        row, col = np.indices((height, width), dtype=np.float32)
+        self.ray_down = (row / height - 0.26) * 0.82
+        self.ray_right = (col - width / 2) / height * 0.82
+        k = np.fft.fftfreq(SIZE) * SIZE * 2 * np.pi
+        self.modes = seeds(5, 0.7, 12000, 4)
+        self.slopes = []
+        self.omega = []
+        for length in LENGTHS:
+            kx, kz = np.meshgrid(k / length, k / length)
+            self.slopes.append(1j * np.stack((kx, kz)))
+            self.omega.append(np.sqrt(9.81 * np.hypot(kx, kz)))
+        self.update_view()
+
+    def update_view(self):
+        camera = self.camera
+        view = (camera.x, camera.z, camera.yaw, camera.pitch)
+        if view == self.view:
+            return
+        self.view = view
+        # View rays cross a horizontal ocean from a camera four metres up.
+        down = self.ray_down * math.cos(camera.pitch) - math.sin(camera.pitch)
+        forward = math.cos(camera.pitch) + self.ray_down * math.sin(camera.pitch)
+        self.sky = down <= 0
+        distance = 4 / np.maximum(down, 0.001)
+        x = camera.x + (self.ray_right * math.cos(camera.yaw) + forward * math.sin(camera.yaw)) * distance
+        z = camera.z + (forward * math.cos(camera.yaw) - self.ray_right * math.sin(camera.yaw)) * distance
+        self.depth = np.clip(0.32 * (x + 6), 0, 6)
+        self.haze = np.exp(-distance / 95)
+        self.sky_color = np.stack((133 - 96*down, 171 - 46*down, 192 - 38*down), axis=-1)
+        self.samples = []
+        for length in LENGTHS:
+            u, v = x * SIZE / length, z * SIZE / length
+            i, j = np.floor(u).astype(int), np.floor(v).astype(int)
+            self.samples.append((i % SIZE, j % SIZE, (u-i).astype(np.float32), (v-j).astype(np.float32)))
+
+    def frame(self, seconds):
+        self.update_view()
+        slopes = np.zeros((2, *self.depth.shape), dtype=np.float32)
+        for mode, omega, gradient, sample in zip(self.modes, self.omega, self.slopes, self.samples):
+            phased = mode * np.exp(-1j * omega * seconds)
+            # Twice the real part includes the conjugate modes used by fft.wgsl.
+            field = 2 * np.fft.ifft2(gradient * phased, norm="forward").real.astype(np.float32)
+            i, j, u, v = sample
+            right, below = (i+1) % SIZE, (j+1) % SIZE
+            top = field[:, j, i]*(1-u) + field[:, j, right]*u
+            bottom = field[:, below, i]*(1-u) + field[:, below, right]*u
+            slopes += top*(1-v) + bottom*v
+        sx, sz = slopes
+        light = np.clip(0.46 + 2*sx + sz, 0, 1)
+        shallow = np.exp(-self.depth * 0.85)
+        glint = np.maximum(0, light - 0.72)**2 * 1100
+        water = np.stack((9+56*shallow+23*light, 46+85*shallow+58*light,
+                          61+36*shallow+61*light), axis=-1) + glint[..., None]
+        water[self.depth == 0] = (186, 169, 126)
+        color = water*self.haze[..., None] + self.sky_color*(1-self.haze[..., None])
+        color[self.sky] = self.sky_color[self.sky]
+        return Image.fromarray(np.clip(color, 0, 255).astype(np.uint8))
+
+
+def run(frames):
+    import fcntl
+    import mmap
+
+    with open("/dev/fb0", "r+b", buffering=0) as fb:
+        def geometry():
+            return struct.unpack_from("=13I", fcntl.ioctl(fb, 0x4600, bytes(160)))
+        width, height, _, _, _, _, bits, _, red, red_bits, _, green, green_bits = geometry()
+        if (bits, red, red_bits, green, green_bits) != (32, 16, 8, 8, 8):
+            raise RuntimeError("Expected the TG4040 32-bit framebuffer")
+        with open("/sys/class/graphics/fb0/stride") as source:
+            stride = int(source.read())
+        ocean = Ocean.for_display(width, height)
+        with mmap.mmap(fb.fileno(), stride * geometry()[3], access=mmap.ACCESS_WRITE) as display:
+            stick = os.open("/dev/input/js0", os.O_RDONLY | os.O_NONBLOCK)
+            start = time.monotonic()
+            count = 0
+            try:
+                axis_count = fcntl.ioctl(stick, 0x80016a11, bytes(1))[0]
+                axis_map = fcntl.ioctl(stick, 0x80406a32, bytes(64))[:axis_count]
+                controls = Stick(axis_map)
+                print(f"Stick axes LX/LY/RX/RY: {controls.indices}", flush=True)
+                previous = start
+                while frames == 0 or count < frames:
+                    while select.select([stick], [], [], 0)[0]:
+                        if controls.event(os.read(stick, 8)):
+                            return
+                    now = time.monotonic()
+                    ocean.camera.move(controls.values, now - previous)
+                    previous = now
+                    image = ocean.display_frame(now-start, (width, height))
+                    raw = image.convert("RGBA").tobytes("raw", "BGRA")
+                    x, y = geometry()[4:6]
+                    offset = y * stride + x * 4
+                    if stride == width * 4:
+                        display[offset:offset+len(raw)] = raw
+                    else:
+                        for row in range(height):
+                            pos = offset + row * stride
+                            display[pos:pos+width*4] = raw[row*width*4:(row+1)*width*4]
+                    count += 1
+            finally:
+                os.close(stick)
+            print(f"{count} frames in {time.monotonic()-start:.2f}s", flush=True)
+
+
+def window():
+    import tkinter as tk
+    from PIL import ImageTk
+
+    root = tk.Tk()
+    root.title("StellarFishery — Brick Pro handheld renderer")
+    root.resizable(False, False)
+    label = tk.Label(root, borderwidth=0)
+    label.pack()
+    root.bind("<Escape>", lambda event: root.destroy())
+    ocean = Ocean.for_display(1024, 768)
+    start = time.monotonic()
+
+    def update():
+        label.image = ImageTk.PhotoImage(ocean.display_frame(time.monotonic() - start, (1024, 768)))
+        label.configure(image=label.image)
+        root.after(16, update)
+
+    update()
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--frames", type=int, default=0, help="stop after this many frames (0 runs continuously)")
+    mode.add_argument("--preview", metavar="PNG", help="save one Brick-sized PNG on this computer")
+    mode.add_argument("--window", action="store_true", help="animate the handheld renderer in a desktop window")
+    parser.add_argument("--time", type=float, metavar="SECONDS", help="preview time in seconds (default 0)")
+    args = parser.parse_args()
+    if args.time is not None and (not args.preview or not math.isfinite(args.time) or args.time < 0):
+        parser.error("--time requires --preview and a finite, nonnegative value")
+    if args.frames < 0:
+        parser.error("--frames must be nonnegative")
+    if args.preview:
+        size = (1024, 768)
+        Ocean.for_display(*size).display_frame(args.time or 0, size).save(args.preview, format="PNG")
+    elif args.window:
+        window()
+    else:
+        run(args.frames)

@@ -1,0 +1,4 @@
+# Window support for the interactive demo (examples/demo.py). Not needed by the
+# acceptance tests, which render offscreen, nor by the Brick deployment.
+-r requirements.txt
+glfw==2.11.0
