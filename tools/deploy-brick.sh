@@ -30,7 +30,7 @@ if $rebuild || ! adb shell "cd $remote && PYTHONPATH=$remote/vendor ./python/bin
         adb shell "cd $remote && tar xzf $part.tar.gz && rm $part.tar.gz"
     done
 fi
-for file in __init__.py waves.py handheld.py; do
+for file in __init__.py waves.py handheld.py caustics.png; do
     adb push "stellar/$file" "$remote/stellar/$file"
 done
 adb push tools/brick-app/demo.py "$remote/demo.py"

@@ -5,6 +5,7 @@ import os
 import select
 import struct
 import time
+from pathlib import Path
 
 import numpy as np
 from PIL import Image
@@ -74,6 +75,7 @@ class Ocean:
     def __init__(self, width, height):
         self.camera = Camera()
         self.view = None
+        self.caustics = None
         row, col = np.indices((height, width), dtype=np.float32)
         self.ray_down = (row / height - 0.26) * 0.82
         self.ray_right = (col - width / 2) / height * 0.82
@@ -96,6 +98,9 @@ class Ocean:
         # Intersect the view rays with the horizontal ocean plane.
         down = self.ray_down * math.cos(camera.pitch) - math.sin(camera.pitch)
         forward = math.cos(camera.pitch) + self.ray_down * math.sin(camera.pitch)
+        if camera.height < 0:
+            self.update_underwater_view(down, forward)
+            return
         # Below the plane, upward rays intersect water. Keep ray travel
         # positive so haze remains bounded on either side of the surface.
         toward_water = down if camera.height >= 0 else -down
@@ -112,8 +117,55 @@ class Ocean:
             i, j = np.floor(u).astype(int), np.floor(v).astype(int)
             self.samples.append((i % SIZE, j % SIZE, (u-i).astype(np.float32), (v-j).astype(np.float32)))
 
+    def update_underwater_view(self, down, forward):
+        """Cache a flat seabed and water ceiling at the internal resolution."""
+        if self.caustics is None:
+            with Image.open(Path(__file__).with_name("caustics.png")) as texture:
+                self.caustics = np.asarray(texture.convert("L")).copy()
+        camera = self.camera
+        # Seabed at -6 m. Crossing it is allowed; beyond it the view is fog.
+        bed_distance = (camera.height + 6) / np.maximum(down, 0.001)
+        bed = (down > 0) & (camera.height >= -6)
+        ceiling_distance = -camera.height / np.maximum(-down, 0.001)
+        ceiling = down < 0
+        distance = np.where(bed, bed_distance, np.where(ceiling, ceiling_distance, 32))
+        # Linear distance fog and a single depth tint replace optical integration.
+        # World projection stays float32; UV, color and fog work uses float16.
+        fog = np.clip((distance - 2) / 26, 0, 1).astype(np.float16)
+        depth = np.float16(min(-camera.height / 40, 1))
+        self.underwater_fog_color = np.array((9, 57, 68), dtype=np.float16) * (1 - depth * np.float16(0.8))
+        self.underwater_base = np.empty((*down.shape, 3), dtype=np.float16)
+        self.underwater_base[:] = np.array((48, 119, 127), dtype=np.float16)
+        self.underwater_base[bed] = np.array((112, 142, 111), dtype=np.float16)
+        self.underwater_base *= np.array((1 - depth * np.float16(0.8), 1 - depth * np.float16(0.4),
+                                          1 - depth * np.float16(0.2)), dtype=np.float16)
+        self.underwater_base *= (1 - fog[..., None])
+        self.underwater_fog = fog[..., None] * self.underwater_fog_color
+        self.caustic_pixels = bed & (fog < 1)
+        travel = distance[self.caustic_pixels]
+        x = camera.x + (self.ray_right[self.caustic_pixels] * math.cos(camera.yaw)
+                        + forward[self.caustic_pixels] * math.sin(camera.yaw)) * travel
+        z = camera.z + (forward[self.caustic_pixels] * math.cos(camera.yaw)
+                        - self.ray_right[self.caustic_pixels] * math.sin(camera.yaw)) * travel
+        self.caustic_u = ((x % 6) / 6).astype(np.float16)
+        self.caustic_v = ((z % 6) / 6).astype(np.float16)
+
+    def underwater_frame(self, seconds):
+        # Exactly one nearest texture lookup per visible seabed pixel.
+        height, width = self.caustics.shape
+        u = (self.caustic_u + np.float16((seconds * 0.025) % 1)) % np.float16(1)
+        v = (self.caustic_v + np.float16((seconds * 0.018) % 1)) % np.float16(1)
+        pattern = self.caustics[(v * height).astype(np.intp), (u * width).astype(np.intp)]
+        factor = np.float16(0.78) + pattern.astype(np.float16) * np.float16(0.8 / 255)
+        color = self.underwater_base.copy()
+        color[self.caustic_pixels] *= factor[:, None]
+        color += self.underwater_fog
+        return Image.fromarray(np.clip(color, 0, 255).astype(np.uint8))
+
     def frame(self, seconds):
         self.update_view()
+        if self.camera.height < 0:
+            return self.underwater_frame(seconds)
         slopes = np.zeros((2, *self.depth.shape), dtype=np.float32)
         for mode, omega, gradient, sample in zip(self.modes, self.omega, self.slopes, self.samples):
             phased = mode * np.exp(-1j * omega * seconds)
@@ -136,7 +188,7 @@ class Ocean:
         return Image.fromarray(np.clip(color, 0, 255).astype(np.uint8))
 
 
-def run(frames):
+def run(frames, initial_height=4):
     import fcntl
     import mmap
 
@@ -149,6 +201,7 @@ def run(frames):
         with open("/sys/class/graphics/fb0/stride") as source:
             stride = int(source.read())
         ocean = Ocean.for_display(width, height)
+        ocean.camera.height = initial_height
         with mmap.mmap(fb.fileno(), stride * geometry()[3], access=mmap.ACCESS_WRITE) as display:
             stick = os.open("/dev/input/js0", os.O_RDONLY | os.O_NONBLOCK)
             start = time.monotonic()
@@ -185,7 +238,7 @@ def run(frames):
             print(f"{count} frames in {time.monotonic()-start:.2f}s", flush=True)
 
 
-def window():
+def window(height=4):
     import tkinter as tk
     from PIL import ImageTk
 
@@ -196,6 +249,7 @@ def window():
     label.pack()
     root.bind("<Escape>", lambda event: root.destroy())
     ocean = Ocean.for_display(1024, 768)
+    ocean.camera.height = height
     start = time.monotonic()
 
     def update():
@@ -214,15 +268,21 @@ if __name__ == "__main__":
     mode.add_argument("--preview", metavar="PNG", help="save one Brick-sized PNG on this computer")
     mode.add_argument("--window", action="store_true", help="animate the handheld renderer in a desktop window")
     parser.add_argument("--time", type=float, metavar="SECONDS", help="preview time in seconds (default 0)")
+    parser.add_argument("--height", type=float, default=4, metavar="METRES",
+                        help="initial camera height; negative values start underwater")
     args = parser.parse_args()
     if args.time is not None and (not args.preview or not math.isfinite(args.time) or args.time < 0):
         parser.error("--time requires --preview and a finite, nonnegative value")
     if args.frames < 0:
         parser.error("--frames must be nonnegative")
+    if not math.isfinite(args.height):
+        parser.error("--height must be finite")
     if args.preview:
         size = (1024, 768)
-        Ocean.for_display(*size).display_frame(args.time or 0, size).save(args.preview, format="PNG")
+        ocean = Ocean.for_display(*size)
+        ocean.camera.height = args.height
+        ocean.display_frame(args.time or 0, size).save(args.preview, format="PNG")
     elif args.window:
-        window()
+        window(args.height)
     else:
-        run(args.frames)
+        run(args.frames, args.height)

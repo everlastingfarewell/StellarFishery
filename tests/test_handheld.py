@@ -2,6 +2,7 @@
 import math
 import struct
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -115,6 +116,43 @@ class HandheldTests(unittest.TestCase):
         stick = Stick(bytes([0, 1, 3, 4]), (304, 305, 307, 308, 314, 315, 310, 311))
         self.assertFalse(stick.event(struct.pack("=IhBB", 0, 1, 1, 7)))
         self.assertEqual(stick.vertical, 1)
+
+    def test_underwater_skips_surface_work_and_resumes(self):
+        ocean = Ocean.for_display(1024, 768)
+        baseline = np.asarray(ocean.frame(1))
+        self.assertIsNone(ocean.caustics)
+        ocean.camera.height = -2
+        with patch("numpy.fft.ifft2", side_effect=AssertionError("Underwater FFT")), \
+             patch("numpy.exp", side_effect=AssertionError("Underwater exponential")):
+            first = np.asarray(ocean.frame(1))
+            second = np.asarray(ocean.frame(4))
+        self.assertFalse(np.array_equal(first, second))
+        self.assertEqual(ocean.caustics.shape, (128, 128))
+        self.assertEqual(ocean.caustics.dtype, np.uint8)
+        self.assertEqual(ocean.underwater_base.dtype, np.float16)
+        self.assertEqual(ocean.caustic_u.dtype, np.float16)
+        ocean.camera.height = 4
+        with patch.object(ocean, "underwater_frame", side_effect=AssertionError("Above-water caustics")):
+            np.testing.assert_array_equal(ocean.frame(1), baseline)
+
+    def test_underwater_projection_and_deep_fog(self):
+        ocean = Ocean.for_display(1024, 768)
+        ocean.camera.height = -2
+        baseline = np.asarray(ocean.frame(1))
+        ocean.camera.x += 2
+        self.assertFalse(np.array_equal(ocean.frame(1), baseline))
+        ocean.camera.height = -10000
+        deep = np.asarray(ocean.frame(1))
+        self.assertLess(deep.mean(), baseline.mean())
+        self.assertFalse(ocean.caustic_pixels.any())
+        np.testing.assert_array_equal(deep, ocean.frame(8))
+        for height in (-0.0001, -6, -6.0001, -10000):
+            for pitch in (-1.2, 0, 1.2):
+                ocean.camera.height, ocean.camera.pitch = height, pitch
+                with np.errstate(over="raise", invalid="raise", divide="raise", under="ignore"):
+                    frame = np.asarray(ocean.frame(1e8))
+                self.assertEqual(frame.shape, (144, 192, 3))
+                self.assertTrue(np.isfinite(ocean.underwater_base).all())
 
 
 if __name__ == "__main__":
